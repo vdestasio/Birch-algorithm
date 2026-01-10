@@ -20,18 +20,21 @@ class Birch():
         fit_predict(): Method to fit the BIRCH model and return cluster assignments.
     '''
 
-    def __init__(self, threshold=0.0, branching_factor=50, leaf_size=50, cluster_method='kmeans'):
+    def __init__(self, page_size = None, max_cfs = 5000, threshold=0.0, branching_factor=50, leaf_size=50, cluster_method='kmeans', handle_outliers=False):            
+        self.page_size = page_size
+        self.max_cfs = max_cfs
+
+        self.handle_outliers = handle_outliers
+
         self.threshold = threshold
-        self.cluster_method = cluster_method
         self.branching_factor = branching_factor
         self.leaf_size = leaf_size
-        self.tree = Birch.CFTree(threshold, branching_factor=branching_factor, leaf_size=leaf_size)
+        self.tree = Birch.CFTree(threshold=threshold, branching_factor=branching_factor, leaf_size=leaf_size, page_size=page_size)
+        
+        self.cluster_method = cluster_method
+        self.possible_outliers = []
         self.centroids = []
         self.cluster_centroids = []
-        self.radii = []
-        self.N_added_list = []
-        self.old_thresholds = [[threshold]]   
-
 
     def _recompute_threshold(self):
         return self.tree.average_nearest_leaf_distance()
@@ -51,10 +54,9 @@ class Birch():
         for i, datapoint in enumerate(X):
             self.tree.insert(datapoint)
             # If we ran out of memory, we recompute the threshold and rebuild a new tree with all the cfs found until now
-            if self.tree.num_cfs>3000:
+            if self.tree.num_cfs>self.max_cfs:
                 new_threshold = self._recompute_threshold()
-                #print(f"CFTree has size {sys.getsizeof(self.tree)}: it is too big! Increasing threshold from {self.threshold} to {new_threshold}")
-                print(f"CFTree has cfs {self.tree.num_cfs}: it is too big! Increasing threshold from {self.threshold} to {new_threshold}")
+                print(f"CFTree has {self.tree.num_cfs} cfs: it is too big! Increasing threshold from {self.threshold} to {new_threshold}")
                 new_tree = Birch.CFTree(new_threshold, branching_factor=self.tree.branching_factor, leaf_size=self.tree.leaf_size)
                 leaf = self.tree.first_leaf
                 # Add all previous cfs to the new tree
@@ -64,23 +66,19 @@ class Birch():
                     leaf = leaf.next
                 self.tree = new_tree
                 self.threshold = new_threshold
-
-        # print(f"Final tree has size {sys.getsizeof(self.tree)}")
-        # print(f"Final tree has cfs {self.tree.num_cfs}")
+            
         
-        # Phase 2: Rebuild a smaller CF tree (optional)
-
         # Phase 3: Global clustering on the leaf entries
         # Collect all centroids from leaf nodes
-        centroids = []
+        leaf_cfs = []
         leaf = self.tree.first_leaf
         while leaf is not None:
             for cf in leaf.CF:
-                centroids.append(cf.centroid())
+                leaf_cfs.append(cf)
             leaf = leaf.next
-        centroids = np.array(centroids)
+        centroids = np.array([cf.centroid() for cf in leaf_cfs])
         self.centroids = centroids
-        print(f"The number of cfs in the leaves is {len(centroids)}")
+        #print(f"The number of cfs in the leaves is {len(centroids)}")
 
         # Number of clusters can't be higher than number of leaf entries
         if n_clusters > len(centroids):
@@ -89,13 +87,15 @@ class Birch():
 
         if self.cluster_method == 'agglomerative':        
             global_clustering = AgglomerativeClustering(n_clusters=n_clusters, linkage='average')
+            labels = global_clustering.fit_predict(centroids)
         elif self.cluster_method == 'kmeans':
             global_clustering = KMeans(n_clusters=n_clusters)
+            labels = global_clustering.fit_predict(centroids, sample_weight=[cf.N for cf in leaf_cfs])
         else:
             raise ValueError(f"Unsupported clustering method: {self.cluster_method}")
 
         # I assigned each centroid to a global cluster
-        labels = global_clustering.fit_predict(centroids)
+        #labels = global_clustering.fit_predict(centroids)
 
         if hasattr(global_clustering, "cluster_centers_"):
             cluster_centroids = global_clustering.cluster_centers_
@@ -107,24 +107,38 @@ class Birch():
             ])
         self.cluster_centroids = cluster_centroids
 
+
         # Phase 4: Cluster refining (optional)
+        cluster_cfs = [None] * n_clusters
+
+        for cf, lbl in zip(leaf_cfs, labels):
+            if cluster_cfs[lbl] is None:
+                cluster_cfs[lbl] = cf
+            else:
+                cluster_cfs[lbl] = cluster_cfs[lbl].add(cf)
+
+        self.cluster_centroids = np.array([
+            cf.centroid() for cf in cluster_cfs
+        ])
+
+        cluster_radii = np.array([
+            cf.radius() for cf in cluster_cfs
+        ])
+
         point_labels = np.empty(len(X), dtype=int)
         for i, x in enumerate(X):
             dists = np.linalg.norm(self.cluster_centroids - x, axis=1)
-            point_labels[i] = np.argmin(dists)
+            possible_label = np.argmin(dists)
+            # Handle outliers if needed
+            if self.handle_outliers and dists[possible_label] > 2 * cluster_radii[possible_label]:
+                # Assign to the closest cluster only if it's within 2*R
+                point_labels[i] = -1  # Mark as noise or unassigned
+            else:
+                point_labels[i] = possible_label
 
         return point_labels
     
-    def fit(self, X):
-        ''' Perform BIRCH clustering on data X.
-        Args:
-            X (numpy.ndarray): Input data of shape (n_samples, n_features).
-        Returns:
-            self: Fitted BIRCH instance.
-        '''
-        pass
 
-    #@dataclass
     class ClusteringFeature():
         def __init__(self, N, LS, SS):
             self.N = N  # Number of data points in the cluster
@@ -142,6 +156,9 @@ class Birch():
         # D in the BIRCH paper
         def diameter(self):
             return np.sqrt((2 * self.N * self.SS - 2*(self.LS.T @ self.LS)) / (self.N * (self.N - 1)))
+        
+        def squared_diameter(self):
+            return (2 * self.N * self.SS - 2*(self.LS.T @ self.LS)) / (self.N * (self.N - 1))
 
         # R in the BIRCH paper
         def radius(self):
@@ -181,8 +198,10 @@ class Birch():
             self.next = None # Only for leaf nodes: pointer to next leaf node
     
     class CFTree():
-        def __init__(self, threshold, branching_factor, leaf_size):
+        def __init__(self, threshold, branching_factor, leaf_size, page_size=None):
             self.root = Birch.CFNode()
+            self.page_size = page_size # P in the BIRCH paper
+
             self.threshold = threshold  # T in the BIRCH paper
             self.branching_factor = branching_factor  # B in the BIRCH paper
             self.leaf_size = leaf_size  # L in the BIRCH paper
@@ -192,7 +211,6 @@ class Birch():
         def average_nearest_leaf_distance(self):
             distances = []
             leaf = self.first_leaf
-
             while leaf is not None:
                 cfs = leaf.CF
                 if len(cfs) >= 2:
@@ -204,10 +222,8 @@ class Birch():
                                 min_dist = d
                     distances.append(min_dist)
                 leaf = leaf.next
-
             if not distances:
                 return self.threshold
-
             return float(np.mean(distances))
 
         def find_closest_cf_idx(self, node, datapoint_cf) -> int:
@@ -215,7 +231,6 @@ class Birch():
             closest = None
             min_distance = float('inf')
             cfs = node.CF
-
             for i in range(len(cfs)):
                 distance = cfs[i].squared_average_intercluster_distance(datapoint_cf)
                 if distance < min_distance:
@@ -229,7 +244,6 @@ class Birch():
             seed1_idx = None
             seed2_idx = None
             cfs = node.CF
-
             for i in range(len(cfs)):
                 for j in range(i + 1, len(cfs)):
                     distance = cfs[i].squared_average_intercluster_distance(cfs[j])
@@ -245,7 +259,6 @@ class Birch():
             seed1_idx = None
             seed2_idx = None
             cfs = node.CF
-
             for i in range(len(cfs)):
                 for j in range(i + 1, len(cfs)):
                     distance = cfs[i].squared_average_intercluster_distance(cfs[j])
@@ -266,14 +279,20 @@ class Birch():
                 self.root = new_root
 
         def insert_cf(self, clustering_feature):
-            '''Insert a clustering feature into the CFTree'''
+            '''Insert a clustering feature into the CFTree
+            Args:
+                clustering_feature (ClusteringFeature): The clustering feature to insert.
+                outlier (bool): Whether the clustering feature is considered an outlier.
+            Returns:
+                is_outlier (bool): True if the clustering feature was treated as an outlier, False otherwise.
+            '''
             split, node = self._insert(self.root, clustering_feature)
             # If the root was split, create a new root: its children are the old root and the new node
             if split:
                 new_root = Birch.CFNode(False, [self.root.own_CF, node.own_CF], [self.root, node])
                 new_root.own_CF = self.root.own_CF.add(node.own_CF)
                 self.root = new_root
-
+            
         # Recursive function to insert a datapoint into the CFTree
         def _insert(self, current, datapoint_cf):
             split = False
@@ -393,7 +412,7 @@ class Birch():
 
                 possible_new_entry = current.CF[closest_entry_idx].add(datapoint_cf)
 
-                if possible_new_entry.radius() <= self.threshold:
+                if possible_new_entry.squared_diameter() <= self.threshold ** 2:
                     # Case 1: Can be absorbed
                     current.CF[closest_entry_idx] = possible_new_entry
                     current.own_CF = current.own_CF.add(datapoint_cf)
@@ -448,3 +467,4 @@ class Birch():
                 
             return False, None
                                
+        
