@@ -1,7 +1,9 @@
+from math import floor
 import numpy as np
 import sys
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.cluster import KMeans
+from sklearn.cluster import DBSCAN
 
 class Birch():
     '''
@@ -10,29 +12,30 @@ class Birch():
     Tian Zhang, Raghu Ramakrishnan, Miron Livny "BIRCH: An Efficient Data Clustering Method for Very Large Databases"
 
     Attributes:
-        threshold (float): The threshold T used to control the maximum radius of subclusters stored at the leaf nodes of the CF tree.
-        branching_factor (int): The maximum number of children for each non-leaf node in the CF tree.
-        leaf_size (int): The maximum number of entries in each leaf node of the CF tree
-        cluster_method (str): The clustering method to use for global clustering ('agglomerative', 'kmeans' supported).
+        page_size (int): The size of the memory page to optimize CF size.
+        memory (int): The total memory available for the CF tree. 
+        threshold (float): The threshold T used to control the maximum radius of subclusters stored at the leaf nodes of the CF tree. If memory is specified, this threshold may be adjusted during fitting.
+        branching_factor (int): The maximum number of children for each non-leaf node in the CF tree. Ignored if page_size is provided.
+        leaf_size (int): The maximum number of entries in each leaf node of the CF tree.
+        cluster_method (str): The clustering method to use for global clustering ('kmeans' supported).
+        handle_outliers (bool): Whether to handle outliers during the assignment phase (phase 4 in the original paper).
 
     Methods:
-        fit(): Method to fit the BIRCH model to the data.
         fit_predict(): Method to fit the BIRCH model and return cluster assignments.
     '''
 
-    def __init__(self, page_size = None, max_cfs = 5000, threshold=0.0, branching_factor=50, leaf_size=50, cluster_method='kmeans', handle_outliers=False):            
+    def __init__(self, threshold=0, branching_factor=50, leaf_size=50, cluster_method='kmeans', handle_outliers=False, page_size = None, memory = None):            
+        self.memory = memory
         self.page_size = page_size
-        self.max_cfs = max_cfs
+        # 
+        self.threshold = threshold
+        # Overwrite branching factor if page_size is given
+        self.branching_factor = branching_factor
 
         self.handle_outliers = handle_outliers
-
-        self.threshold = threshold
-        self.branching_factor = branching_factor
         self.leaf_size = leaf_size
-        self.tree = Birch.CFTree(threshold=threshold, branching_factor=branching_factor, leaf_size=leaf_size, page_size=page_size)
-        
+        self.tree = None
         self.cluster_method = cluster_method
-        self.possible_outliers = []
         self.centroids = []
         self.cluster_centroids = []
 
@@ -49,24 +52,43 @@ class Birch():
             assignment (numpy.ndarray): Cluster assignments of shape (n_samples,).
         '''
         data_dim = X.shape[1]
+        cf_size_bytes = 16 + 8*data_dim
+
+        if self.page_size is not None:
+            # Estimate the maximum number of CFs that can fit in memory
+            self.branching_factor = floor(self.page_size / cf_size_bytes)
+            self.leaf_size = self.branching_factor
+        if self.memory is not None:
+            max_cfs = self.memory // cf_size_bytes
+            self.max_cfs = max_cfs
+
+        print(f"Using branching factor B={self.branching_factor} and max_cfs {self.max_cfs}")
+        self.tree = Birch.CFTree(threshold=self.threshold, branching_factor=self.branching_factor, leaf_size=self.leaf_size)
 
         # Phase 1: Build the CF tree
-        for i, datapoint in enumerate(X):
-            self.tree.insert(datapoint)
-            # If we ran out of memory, we recompute the threshold and rebuild a new tree with all the cfs found until now
-            if self.tree.num_cfs>self.max_cfs:
-                new_threshold = self._recompute_threshold()
-                print(f"CFTree has {self.tree.num_cfs} cfs: it is too big! Increasing threshold from {self.threshold} to {new_threshold}")
-                new_tree = Birch.CFTree(new_threshold, branching_factor=self.tree.branching_factor, leaf_size=self.tree.leaf_size)
-                leaf = self.tree.first_leaf
-                # Add all previous cfs to the new tree
-                while leaf is not None:
-                    for cf in leaf.CF:
-                        new_tree.insert_cf(cf)
-                    leaf = leaf.next
-                self.tree = new_tree
-                self.threshold = new_threshold
-            
+        
+        # If there is no memory specified we do no rebuilds, like in the sklearn version
+        if self.memory is None:
+            for i, datapoint in enumerate(X):
+                self.tree.insert(datapoint)
+        else:
+            for i, datapoint in enumerate(X):
+                self.tree.insert(datapoint)
+                # If we ran out of memory, we recompute the threshold and rebuild a new tree with all the cfs found until now                
+                if self.tree.num_cfs>self.max_cfs:
+                    new_threshold = self._recompute_threshold()
+                    #print(f"CFTree has {self.tree.num_cfs} cfs: it is too big! Increasing threshold from {self.threshold} to {new_threshold}")
+                    new_tree = Birch.CFTree(new_threshold, branching_factor=self.tree.branching_factor, leaf_size=self.tree.leaf_size)
+                    leaf = self.tree.first_leaf
+                    # Add all previous cfs to the new tree
+                    while leaf is not None:
+                        for cf in leaf.CF:
+                            new_tree.insert_cf(cf)
+                        leaf = leaf.next
+                    self.tree = new_tree
+                    self.threshold = new_threshold
+        
+        print(f"Final CFTree fits into requested memory with threshold {self.threshold}")
         
         # Phase 3: Global clustering on the leaf entries
         # Collect all centroids from leaf nodes
@@ -78,24 +100,25 @@ class Birch():
             leaf = leaf.next
         centroids = np.array([cf.centroid() for cf in leaf_cfs])
         self.centroids = centroids
-        #print(f"The number of cfs in the leaves is {len(centroids)}")
 
         # Number of clusters can't be higher than number of leaf entries
         if n_clusters > len(centroids):
             print(f"Warning: Requested number of clusters ({n_clusters}) is greater than number of leaf entries ({len(centroids)}). Reducing n_clusters to {len(centroids)}.")
         n_clusters = min(n_clusters, len(centroids))
 
-        if self.cluster_method == 'agglomerative':        
-            global_clustering = AgglomerativeClustering(n_clusters=n_clusters, linkage='average')
+        if self.cluster_method == 'agglomerative':
+            if len(centroids)> 10000:
+                linkage_type = 'single'
+            else:
+                linkage_type = 'ward'
+            global_clustering = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage_type)
             labels = global_clustering.fit_predict(centroids)
         elif self.cluster_method == 'kmeans':
-            global_clustering = KMeans(n_clusters=n_clusters)
+            global_clustering = KMeans(n_clusters=n_clusters, init='k-means++', n_init=10, random_state=0)
             labels = global_clustering.fit_predict(centroids, sample_weight=[cf.N for cf in leaf_cfs])
         else:
             raise ValueError(f"Unsupported clustering method: {self.cluster_method}")
 
-        # I assigned each centroid to a global cluster
-        #labels = global_clustering.fit_predict(centroids)
 
         if hasattr(global_clustering, "cluster_centers_"):
             cluster_centroids = global_clustering.cluster_centers_
@@ -104,6 +127,7 @@ class Birch():
             cluster_centroids = np.array([
                 centroids[labels == k].mean(axis=0)
                 for k in range(n_clusters)
+                if k!=-1
             ])
         self.cluster_centroids = cluster_centroids
 
@@ -198,10 +222,8 @@ class Birch():
             self.next = None # Only for leaf nodes: pointer to next leaf node
     
     class CFTree():
-        def __init__(self, threshold, branching_factor, leaf_size, page_size=None):
+        def __init__(self, threshold, branching_factor, leaf_size):
             self.root = Birch.CFNode()
-            self.page_size = page_size # P in the BIRCH paper
-
             self.threshold = threshold  # T in the BIRCH paper
             self.branching_factor = branching_factor  # B in the BIRCH paper
             self.leaf_size = leaf_size  # L in the BIRCH paper
@@ -276,6 +298,7 @@ class Birch():
             if split:
                 new_root = Birch.CFNode(False, [self.root.own_CF, node.own_CF], [self.root, node])
                 new_root.own_CF = self.root.own_CF.add(node.own_CF)
+                self.num_cfs +=2
                 self.root = new_root
 
         def insert_cf(self, clustering_feature):
@@ -291,8 +314,9 @@ class Birch():
             if split:
                 new_root = Birch.CFNode(False, [self.root.own_CF, node.own_CF], [self.root, node])
                 new_root.own_CF = self.root.own_CF.add(node.own_CF)
+                self.num_cfs +=2
                 self.root = new_root
-            
+        
         # Recursive function to insert a datapoint into the CFTree
         def _insert(self, current, datapoint_cf):
             split = False
@@ -305,7 +329,7 @@ class Birch():
                         current.own_CF = current.own_CF.add(new_child.own_CF)
                         current.CF.append(new_child.own_CF)
                         current.children.append(new_child)
-                        # Merging refinement TODO
+                        self.num_cfs +=1
                         cf_idxs = self.find_closest_seeds_idx(current)
                         idx1, idx2 = cf_idxs
                         split_pair = {current.children[closest_child_idx], new_child}
@@ -319,6 +343,7 @@ class Birch():
                             # Remove idx2
                             del current.children[idx2]
                             del current.CF[idx2]
+                            self.num_cfs -=1
                             if len(current.children[idx1].children) > self.branching_factor:
                                 # Split in two nodes
                                 cf_idxs = self.find_furthest_seeds_idx(current.children[idx1])
@@ -405,9 +430,9 @@ class Birch():
                 # This happens only for the first insertion in an empty tree
                 if closest_entry_idx is None:
                     current.CF.append(datapoint_cf)
+                    self.num_cfs += 1
                     current.own_CF = datapoint_cf
                     self.first_leaf = current
-                    self.num_cfs += 1
                     return False, None
 
                 possible_new_entry = current.CF[closest_entry_idx].add(datapoint_cf)
@@ -420,8 +445,8 @@ class Birch():
                 elif (len(current.CF) < self.leaf_size):
                     # Case 2: Can create a new entry on the leaf
                     current.CF.append(datapoint_cf)
-                    current.own_CF = current.own_CF.add(datapoint_cf)
                     self.num_cfs +=1
+                    current.own_CF = current.own_CF.add(datapoint_cf)
                     return False, None
                 elif (len(current.CF) == self.leaf_size):
                     # Case 3: Need to split the node
@@ -449,10 +474,11 @@ class Birch():
                     if dist_to_r < dist_to_l:
                         r_split.CF.append(datapoint_cf)
                         r_split.own_CF = r_split.own_CF.add(datapoint_cf)
+                        self.num_cfs +=1
                     else:
                         l_split.CF.append(datapoint_cf)
                         l_split.own_CF = l_split.own_CF.add(datapoint_cf)
-                    self.num_cfs +=1
+                        self.num_cfs +=1
                     # Update current node to coincide with right split (this means that I will never add a new leaf on the left of another leaf, so I don't need to update the first leaf pointer)
                     l_split.prev = current
                     l_split.next = current.next
